@@ -49,7 +49,7 @@ def main():
     ap.add_argument("run_file")
     ap.add_argument("--server", required=True, help="server base URL (with or without /v1)")
     ap.add_argument("--index", type=int, default=0)
-    ap.add_argument("--extra-body", default=None, help="e.g. chat_template_kwargs, same as run.py")
+    ap.add_argument("--extra-body", default=None, help="e.g. chat_template_kwargs, same as extra_body in run.py --llm-args")
     ap.add_argument("--show", action="store_true", help="print the rendered prompt")
     a = ap.parse_args()
 

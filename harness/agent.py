@@ -1,10 +1,4 @@
-"""Append-only agent loop.
-
-Each model reply is appended exactly as litellm returns it, followed by one tool message per
-tool call. Nothing already in `messages` is edited or removed during a run, and the full list
-is sent on every turn. litellm handles each provider's message format (including reasoning) in
-both directions, so the loop behaves the same whatever the provider or model.
-"""
+"""Append-only agent loop: each reply and its tool results are appended; the full history is sent every turn."""
 import time
 
 import litellm
@@ -13,18 +7,13 @@ from .env import TOOLS, SearchEnv
 
 SYSTEM_PROMPT = """You are a research assistant with access to a search tool. Research the user's question using the tools, and answer based on what you find. You can make at most {max_tool_calls} tool calls.
 
-When you are done, reply without calling a tool and give your final answer inside <answer></answer>, for example <answer>Mitsuko Igarashi</answer>."""
+When you are done, reply to the user with your answer without calling a tool."""
 
 USER_TEMPLATE = "{question}"
 
 
 def as_dict(msg) -> dict:
-    """The reply as a plain dict, with the server's own field names restored.
-
-    litellm renames some fields when it reads a response (e.g. a server's `reasoning` becomes
-    `reasoning_content`) and keeps the originals in `provider_specific_fields`. Putting those back
-    at the top level means every server gets its own fields back, under the names it uses.
-    """
+    """The reply as a dict, with provider_specific_fields (e.g. original `reasoning`) restored at top level."""
     d = msg.model_dump(exclude_none=True) if hasattr(msg, "model_dump") else dict(msg)
     d = {k: v for k, v in d.items() if v is not None}
     for k, v in (d.pop("provider_specific_fields", None) or {}).items():
@@ -79,8 +68,8 @@ async def run_episode(question: str, env: SearchEnv, model: str, completion_kwar
         for tc in calls:
             name, args = tc["function"]["name"], tc["function"]["arguments"]
             if tool_calls_made >= max_tool_calls:
-                text, meta = ("Tool budget exhausted. Do not call tools again; give your final answer "
-                              "inside <answer></answer> now."), {"error": "budget"}
+                text, meta = ("Tool budget exhausted. Do not call tools again; "
+                              "give your final answer now."), {"error": "budget"}
             else:
                 text, meta = await env.call(name, args)
                 tool_calls_made += 1

@@ -1,14 +1,17 @@
 """Run the search agent over a question file and write one JSON line per question.
 
-Example (Qwen served by vLLM on another machine):
+Example:
   python run.py \
-    --questions data/infoseek_hard_6k.jsonl --limit 500 \
-    --model openai/Qwen/Qwen3.8-27B --api-base http://gpu-box:8001/v1 \
+    --questions data/test.jsonl --limit 500 \
+    --llm openai/Qwen/Qwen3.8-27B \
+    --llm-args '{"api_base": "http://gpu-box:8001/v1", "api_key": "EMPTY",
+                 "extra_body": {"chat_template_kwargs": {"enable_thinking": true}}}' \
+    --judge-llm anthropic/claude-sonnet-5-5 \
     --index-url http://index-box:8000 \
-    --extra-body '{"chat_template_kwargs": {"enable_thinking": true}}' \
     --out runs/qwen3.8-27b.jsonl --concurrency 32
 
-Re-running with the same --out skips questions already written (resume).
+--llm-args / --judge-llm-args are JSON kwargs for litellm.acompletion, merged over the defaults.
+Re-running with the same --out resumes.
 """
 import argparse
 import asyncio
@@ -21,10 +24,27 @@ import litellm
 
 from harness.agent import run_episode
 from harness.env import SearchEnv
-from harness.scoring import contains, exact_match, extract_answer, judge
+from harness.scoring import judge
 
 litellm.drop_params = True
 litellm.suppress_debug_info = True
+
+LLM_DEFAULTS = {"temperature": 0.6, "top_p": 0.95, "max_tokens": 8192, "timeout": 600}
+JUDGE_DEFAULTS = {"temperature": 0, "timeout": 600}
+
+
+def json_object(text: str) -> dict:
+    try:
+        d = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise argparse.ArgumentTypeError(f"not valid JSON: {e}")
+    if not isinstance(d, dict):
+        raise argparse.ArgumentTypeError("must be a JSON object")
+    return d
+
+
+def redact(args: dict) -> dict:
+    return {k: v for k, v in args.items() if not k.lower().endswith(("key", "secret", "password", "token"))}
 
 
 def load_questions(path: str) -> list[dict]:
@@ -43,40 +63,50 @@ async def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--questions", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--model", required=True, help="litellm model string, e.g. openai/<served-name>")
-    ap.add_argument("--api-base", default=os.environ.get("MODEL_API_BASE"))
-    ap.add_argument("--api-key", default=os.environ.get("MODEL_API_KEY", "EMPTY"))
+    ap.add_argument("--llm", required=True, help="litellm model string for the agent, e.g. openai/<served-name>")
+    ap.add_argument("--llm-args", type=json_object, default={},
+                    help=f"JSON kwargs for the agent's litellm calls, merged over {LLM_DEFAULTS}")
+    ap.add_argument("--judge-llm", required=True, help="litellm model string for the judge")
+    ap.add_argument("--judge-llm-args", type=json_object, default={},
+                    help=f"JSON kwargs for the judge's litellm calls, merged over {JUDGE_DEFAULTS}")
     ap.add_argument("--index-url", default=os.environ.get("INDEX_URL", "http://localhost:8000"))
-    ap.add_argument("--temperature", type=float, default=0.6)
-    ap.add_argument("--top-p", type=float, default=0.95)
-    ap.add_argument("--max-tokens", type=int, default=8192, help="per model turn")
-    ap.add_argument("--extra-body", default=None, help="JSON passed to the server, e.g. chat_template_kwargs")
     ap.add_argument("--max-tool-calls", type=int, default=20)
     ap.add_argument("--max-turns", type=int, default=40)
     ap.add_argument("--search-k", type=int, default=5)
     ap.add_argument("--page-words", type=int, default=1200)
     ap.add_argument("--concurrency", type=int, default=16)
-    ap.add_argument("--timeout", type=float, default=600, help="seconds per model call")
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--shuffle-seed", type=int, default=None)
-    ap.add_argument("--judge-model", default=None, help="litellm model for LLM-judge scoring (optional)")
-    ap.add_argument("--judge-api-base", default=None)
-    ap.add_argument("--judge-api-key", default=None)
     a = ap.parse_args()
+    llm_kwargs = {**LLM_DEFAULTS, **a.llm_args}
+    judge_kwargs = {**JUDGE_DEFAULTS, **a.judge_llm_args}
+    config = {**vars(a), "llm_args": redact(llm_kwargs), "judge_llm_args": redact(judge_kwargs)}
 
     qs = load_questions(a.questions)
     if a.shuffle_seed is not None:
         random.Random(a.shuffle_seed).shuffle(qs)
     if a.limit:
         qs = qs[: a.limit]
+    sem, lock = asyncio.Semaphore(a.concurrency), asyncio.Lock()
     done = set()
     if os.path.exists(a.out):
-        # keep finished episodes; drop ones that failed on a server/connection error so they rerun
         with open(a.out) as fh:
             prev = [json.loads(l) for l in fh if l.strip()]
         kept = [r for r in prev if r["status"] != "model_error"]
         if len(kept) < len(prev):
             print(f"Retrying {len(prev) - len(kept)} episodes that ended in model_error")
+        rejudge = [r for r in kept if r.get("judge", False) is None]
+        if rejudge:
+            print(f"Re-judging {len(rejudge)} episodes whose judge call failed")
+
+            async def rejudge_one(r):
+                async with sem:
+                    return await judge(r["question"], r["golds"], r.get("response", ""), a.judge_llm, **judge_kwargs)
+
+            results = await asyncio.gather(*(rejudge_one(r) for r in rejudge))
+            for r, v in zip(rejudge, results):
+                r.update(v, judge_model=a.judge_llm)
+        if len(kept) < len(prev) or rejudge:
             with open(a.out, "w") as fh:
                 for r in kept:
                     fh.write(json.dumps(r, ensure_ascii=False) + "\n")
@@ -90,40 +120,30 @@ async def main():
     except Exception as e:  # noqa: BLE001
         sys.exit(f"Cannot reach index server at {a.index_url}: {e}")
 
-    kwargs = {"api_base": a.api_base, "api_key": a.api_key, "temperature": a.temperature,
-              "top_p": a.top_p, "max_tokens": a.max_tokens, "timeout": a.timeout}
-    if a.extra_body:
-        kwargs["extra_body"] = json.loads(a.extra_body)
-    judge_kwargs = {k: v for k, v in {"api_base": a.judge_api_base, "api_key": a.judge_api_key}.items() if v}
-    config = {k: v for k, v in vars(a).items() if k not in ("api_key", "judge_api_key")}
-
     print(f"{len(qs)} questions, {len(done)} already done, running {len(todo)}")
-    sem, lock = asyncio.Semaphore(a.concurrency), asyncio.Lock()
-    stats = {"n": 0, "em": 0, "contains": 0}
+    stats = {"n": 0, "correct": 0, "judge_failed": 0}
 
     async def one(q):
         async with sem:
-            ep = await run_episode(q["question"], env, a.model, kwargs, a.max_tool_calls, a.max_turns)
-            pred, tagged = extract_answer(ep["final_content"]) if ep["status"] == "answered" else ("", False)
+            ep = await run_episode(q["question"], env, a.llm, llm_kwargs, a.max_tool_calls, a.max_turns)
+            response = ep["final_content"] if ep["status"] == "answered" else ""
+            verdict = await judge(q["question"], q["golds"], response, a.judge_llm, **judge_kwargs)
             rec = {
                 "id": q["id"], "question": q["question"], "answer": q["answer"], "golds": q["golds"],
-                **q["meta"], "model": a.model, "pred": pred, "answer_tagged": tagged,
-                "em": exact_match(pred, q["golds"]), "contains": contains(pred, q["golds"]),
+                **q["meta"], "model": a.llm, "judge_model": a.judge_llm, "response": response, **verdict,
                 **{k: ep[k] for k in ("status", "error", "num_turns", "num_tool_calls", "usage", "seconds", "tool_log")},
                 "messages": ep["messages"], "config": config,
             }
-            if a.judge_model:
-                # Untagged answers: let the judge read the whole final message, so format
-                # failures (answer_tagged=False) can be separated from wrong answers.
-                judge_input = pred if tagged else ep["final_content"][-2000:]
-                rec["judge"] = await judge(q["question"], q["answer"], judge_input, a.judge_model, **judge_kwargs)
         async with lock:
             with open(a.out, "a") as fh:
                 fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
-            stats["n"] += 1; stats["em"] += rec["em"]; stats["contains"] += rec["contains"]
+            stats["n"] += 1
+            stats["correct"] += rec["judge"] is True
+            stats["judge_failed"] += rec["judge"] is None
             n = stats["n"]
             if n % 10 == 0 or n == len(todo):
-                print(f"[{n}/{len(todo)}] EM {stats['em']/n:.1%}  contains {stats['contains']/n:.1%}", flush=True)
+                print(f"[{n}/{len(todo)}] judge accuracy {stats['correct']/n:.1%}"
+                      f"  (judge failed on {stats['judge_failed']})", flush=True)
 
     await asyncio.gather(*(one(q) for q in todo))
     await env.close()

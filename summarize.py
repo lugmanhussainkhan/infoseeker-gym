@@ -21,16 +21,16 @@ def summarize(rows, label):
     n = len(rows)
     if not n:
         return
-    acc = lambda key: sum(bool(r.get(key)) for r in rows) / n
-    judged = [r for r in rows if r.get("judge") is not None]
+    correct = sum(r.get("judge") is True for r in rows)
+    failed = sum(r.get("judge") is None for r in rows)
     tc = [r["num_tool_calls"] for r in rows]
     toks = [r["usage"]["completion_tokens"] for r in rows]
     ctx = [r["usage"]["max_prompt_tokens"] for r in rows]
     status = collections.Counter(r["status"] for r in rows)
     calls = collections.Counter(t["name"] for r in rows for t in r["tool_log"])
-    line = (f"{label:<28} n={n:<5} EM {acc('em'):6.1%}  contains {acc('contains'):6.1%}"
-            + (f"  judge {sum(r['judge'] for r in judged)/len(judged):6.1%}" if judged else "")
-            + f"  tagged {acc('answer_tagged'):6.1%}"
+    line = (f"{label:<28} n={n:<5} accuracy {correct/n:6.1%}"
+            + (f" (judge failed {failed}; {correct/(n-failed):6.1%} of judged)" if failed and n > failed else
+               f" (judge failed {failed})" if failed else "")
             + f" | tool calls mean {statistics.mean(tc):4.1f} (search {calls['search']/n:.1f}, open {calls['open_page']/n:.1f})"
             + f" | out tokens mean {statistics.mean(toks):6.0f}  max ctx {max(ctx):6d}"
             + f" | " + ", ".join(f"{k} {v}" for k, v in status.most_common()))

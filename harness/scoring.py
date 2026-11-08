@@ -1,58 +1,39 @@
-"""Answer extraction and scoring: normalized exact match, containment, optional LLM judge."""
-import re
-import string
-
+"""LLM-judge scoring with structured output."""
 import litellm
+from pydantic import BaseModel
 
-ANSWER_RE = re.compile(r"<answer>(.*?)</answer>", re.S | re.I)
-
-
-def extract_answer(content: str) -> tuple[str, bool]:
-    """Last <answer>...</answer> in the final message; falls back to the stripped content."""
-    content = content or ""
-    found = ANSWER_RE.findall(content)
-    if found:
-        return found[-1].strip(), True
-    return content.strip()[-300:], False
-
-
-def normalize(s: str) -> str:
-    s = re.sub(r"\s*\([^)]*\)\s*$", "", s or "")          # trailing disambiguator
-    s = s.lower()
-    s = "".join(ch for ch in s if ch not in set(string.punctuation))
-    s = re.sub(r"\b(a|an|the)\b", " ", s)
-    return " ".join(s.split())
-
-
-def exact_match(pred: str, golds: list[str]) -> bool:
-    p = normalize(pred)
-    return bool(p) and any(p == normalize(g) for g in golds)
-
-
-def contains(pred: str, golds: list[str]) -> bool:
-    p = normalize(pred)
-    return bool(p) and any(normalize(g) and normalize(g) in p for g in golds)
-
-
-JUDGE_PROMPT = """Decide whether the predicted answer refers to the same thing as the gold answer.
-Ignore formatting, capitalization and minor wording differences; a more or less specific name for the same entity counts as correct.
+JUDGE_PROMPT = """You are grading a research assistant's response to a question against the gold answer.
 
 Question: {question}
 Gold answer: {gold}
-Predicted answer: {pred}
+Response: {response}
 
-Reply with exactly one word: CORRECT or INCORRECT."""
+The response is correct if the answer it gives refers to the same thing as the gold answer. Ignore formatting, capitalization, extra explanation and minor wording differences; a more or less specific name for the same entity counts as correct. The response is incorrect if it gives a different answer, gives several candidate answers without committing to one, or does not answer.
+
+Briefly explain your decision in "reasoning", then set "verdict" to true if the response is correct, false otherwise."""
 
 
-async def judge(question: str, gold: str, pred: str, model: str, **kwargs) -> bool | None:
-    if not pred.strip():
-        return False
+class Verdict(BaseModel):
+    reasoning: str
+    verdict: bool
+
+
+def format_gold(golds: list[str]) -> str:
+    return golds[0] if len(golds) == 1 else f"{golds[0]} (also accepted: {'; '.join(golds[1:])})"
+
+
+async def judge(question: str, golds: list[str], response: str, model: str, **kwargs) -> dict:
+    """Empty response -> False without a call; failed call or invalid output -> None."""
+    result = {"judge": None, "judge_reasoning": None, "judge_output": None, "judge_error": None}
+    if not (response or "").strip():
+        return {**result, "judge": False}
+    prompt = JUDGE_PROMPT.format(question=question, gold=format_gold(golds), response=response)
     try:
-        r = await litellm.acompletion(
-            model=model, temperature=0, max_tokens=8,
-            messages=[{"role": "user", "content": JUDGE_PROMPT.format(question=question, gold=gold, pred=pred)}],
-            **kwargs)
-        out = (r.choices[0].message.content or "").strip().upper()
-        return out.startswith("CORRECT")
-    except Exception:  # noqa: BLE001
-        return None
+        r = await litellm.acompletion(model=model, messages=[{"role": "user", "content": prompt}],
+                                      response_format=Verdict, **kwargs)
+        result["judge_output"] = r.choices[0].message.content
+        v = Verdict.model_validate_json(result["judge_output"])
+        result["judge"], result["judge_reasoning"] = v.verdict, v.reasoning
+    except Exception as e:  # noqa: BLE001
+        result["judge_error"] = f"{type(e).__name__}: {str(e)[:500]}"
+    return result
